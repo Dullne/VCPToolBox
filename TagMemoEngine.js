@@ -194,6 +194,39 @@ class TagMemoEngine {
     }
 
     /**
+     * 解析 semanticGain 配置，兼容嵌套格式 ({semanticGain:{enabled,peak,sigma,lowSimFallback}})
+     * 与 AdminPanel 生成的扁平格式 (semanticGainEnabled/Peak/Sigma/LowSimFallback)。
+     * 优先嵌套对象；若两套格式同时存在且冲突，打 warn。
+     */
+    parseSemanticGainConfig(matrixConfig = {}) {
+        const nested = matrixConfig.semanticGain;
+        const hasNested = nested && typeof nested === 'object';
+        const hasFlat = 'semanticGainEnabled' in matrixConfig
+            || 'semanticGainPeak' in matrixConfig
+            || 'semanticGainSigma' in matrixConfig
+            || 'semanticGainLowSimFallback' in matrixConfig;
+
+        if (hasNested && hasFlat) {
+            const nestedEnabled = nested.enabled;
+            const flatEnabled = matrixConfig.semanticGainEnabled;
+            if (nestedEnabled !== undefined && flatEnabled !== undefined
+                && Boolean(nestedEnabled) !== Boolean(flatEnabled)) {
+                console.warn('[TagMemoEngine] rag_params.json 中 semanticGain 嵌套格式与扁平格式的 enabled 值冲突，优先使用嵌套格式。检查 AdminPanel 保存逻辑是否覆盖了嵌套字段。');
+            }
+        }
+
+        const semGainCfg = hasNested ? nested : {};
+        const rawSemEnabled = semGainCfg.enabled ?? matrixConfig.semanticGainEnabled;
+        return {
+            enabled: (rawSemEnabled === true || rawSemEnabled === 1)
+                || (typeof rawSemEnabled === 'number' && rawSemEnabled >= 1),
+            peak: semGainCfg.peak ?? matrixConfig.semanticGainPeak ?? 0.65,
+            sigma: semGainCfg.sigma ?? matrixConfig.semanticGainSigma ?? 0.25,
+            lowSimFallback: semGainCfg.lowSimFallback ?? matrixConfig.semanticGainLowSimFallback ?? 0.1
+        };
+    }
+
+    /**
      * 🌟 TagMemo 浪潮 + EPA + Residual Pyramid + Worldview Gating + LIF Spike Propagation (V6)
      *
      * 返回值中的 energyField 是查询级距离场。不要依赖 lastEnergyField 参与搜索重排：
@@ -849,16 +882,12 @@ class TagMemoEngine {
             const REVERSE_ANCHOR_MAX = matrixConfig.reverseAnchorMax ?? 1.5;
 
             // γ: 语义增益（基于边向量距离）
-            // 同时兼容嵌套对象 (semanticGain.{enabled,peak,sigma,lowSimFallback})
-            // 与平铺数值字段 (semanticGainEnabled / semanticGainPeak / semanticGainSigma / semanticGainLowSimFallback)
-            // 平铺写法是为了适配 AdminPanel-Vue RagTuning UI 的 nested 单层渲染约束。
-            const semGainCfg = matrixConfig.semanticGain || {};
-            const rawSemEnabled = semGainCfg.enabled ?? matrixConfig.semanticGainEnabled;
-            const SEM_GAIN_ENABLED = (rawSemEnabled === true || rawSemEnabled === 1)
-                || (typeof rawSemEnabled === 'number' && rawSemEnabled >= 1);
-            const SEM_PEAK = semGainCfg.peak ?? matrixConfig.semanticGainPeak ?? 0.65;
-            const SEM_SIGMA = semGainCfg.sigma ?? matrixConfig.semanticGainSigma ?? 0.25;
-            const SEM_LOW_FALLBACK = semGainCfg.lowSimFallback ?? matrixConfig.semanticGainLowSimFallback ?? 0.1;
+            // parseSemanticGainConfig 统一处理嵌套/扁平两种格式，格式冲突时 warn。
+            const semGain = this.parseSemanticGainConfig(matrixConfig);
+            const SEM_GAIN_ENABLED = semGain.enabled;
+            const SEM_PEAK = semGain.peak;
+            const SEM_SIGMA = semGain.sigma;
+            const SEM_LOW_FALLBACK = semGain.lowSimFallback;
 
             // 反转守卫：逆流永远不超过顺流的 95%
             const REVERSE_INVERSION_GUARD = matrixConfig.reverseInversionGuard ?? 0.95;
@@ -1191,6 +1220,203 @@ class TagMemoEngine {
         }
     }
 
+    _ensurePairwiseSimilarityTable() {
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS tag_pair_similarity (
+                tag_a INTEGER NOT NULL,
+                tag_b INTEGER NOT NULL,
+                similarity REAL NOT NULL,
+                model_sig TEXT NOT NULL,
+                computed_at INTEGER NOT NULL,
+                PRIMARY KEY (tag_a, tag_b),
+                FOREIGN KEY (tag_a) REFERENCES tags(id) ON DELETE CASCADE,
+                FOREIGN KEY (tag_b) REFERENCES tags(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_pair_sim_model ON tag_pair_similarity(model_sig);
+        `);
+    }
+
+    _pairKey(tagA, tagB) {
+        const a = Number(tagA);
+        const b = Number(tagB);
+        if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return null;
+        return a < b ? `${a}:${b}` : `${b}:${a}`;
+    }
+
+    _collectCooccurringTagPairs(maxTagsPerFile = 100) {
+        const rows = this.db.prepare('SELECT file_id, tag_id FROM file_tags ORDER BY file_id').all();
+        const pairSet = new Set();
+        let currentFileId = null;
+        let fileTags = [];
+
+        const flushFileTags = () => {
+            if (fileTags.length < 2 || fileTags.length > maxTagsPerFile) return;
+            for (let i = 0; i < fileTags.length; i += 1) {
+                for (let j = i + 1; j < fileTags.length; j += 1) {
+                    const key = this._pairKey(fileTags[i], fileTags[j]);
+                    if (key) pairSet.add(key);
+                }
+            }
+        };
+
+        for (const row of rows) {
+            if (currentFileId !== null && row.file_id !== currentFileId) {
+                flushFileTags();
+                fileTags = [];
+            }
+            currentFileId = row.file_id;
+            fileTags.push(row.tag_id);
+        }
+        flushFileTags();
+
+        return pairSet;
+    }
+
+    _loadTagVectorsForPairwise() {
+        const dim = Number(this.config?.dimension || 0);
+        if (!Number.isFinite(dim) || dim <= 0) {
+            throw new Error(`Invalid TagMemo vector dimension: ${this.config?.dimension}`);
+        }
+
+        const tagVectors = new Map();
+        const rows = this.db.prepare('SELECT id, vector FROM tags WHERE vector IS NOT NULL').all();
+
+        for (const row of rows) {
+            const vector = this._decodeVectorBlob(row.vector, dim, `tag ${row.id}`);
+            if (vector) {
+                tagVectors.set(Number(row.id), vector);
+            }
+        }
+
+        return tagVectors;
+    }
+
+    _cosineSimilarity(vectorA, vectorB, normCache, tagA, tagB) {
+        const getNorm = (tagId, vector) => {
+            if (normCache.has(tagId)) return normCache.get(tagId);
+            let sum = 0;
+            for (let i = 0; i < vector.length; i += 1) {
+                sum += vector[i] * vector[i];
+            }
+            const norm = Math.sqrt(sum);
+            normCache.set(tagId, norm);
+            return norm;
+        };
+
+        let dot = 0;
+        for (let i = 0; i < vectorA.length; i += 1) {
+            dot += vectorA[i] * vectorB[i];
+        }
+
+        const denom = getNorm(tagA, vectorA) * getNorm(tagB, vectorB);
+        return denom > 1e-9 ? dot / denom : 0;
+    }
+
+    _insertPairwiseSimilarities(rows, fullRebuild) {
+        const deleteAll = this.db.prepare('DELETE FROM tag_pair_similarity');
+        const insertPair = this.db.prepare(`
+            INSERT OR REPLACE INTO tag_pair_similarity
+                (tag_a, tag_b, similarity, model_sig, computed_at)
+            VALUES (?, ?, ?, ?, ?)
+        `);
+        const writeChunk = this.db.transaction((chunk, deleteFirst) => {
+            if (deleteFirst) deleteAll.run();
+            for (const row of chunk) {
+                insertPair.run(row.tagA, row.tagB, row.similarity, this.modelSig, row.computedAt);
+            }
+        });
+
+        if (rows.length === 0) {
+            if (fullRebuild) writeChunk([], true);
+            return;
+        }
+
+        const chunkSize = 1000;
+        for (let i = 0; i < rows.length; i += chunkSize) {
+            writeChunk(rows.slice(i, i + chunkSize), fullRebuild && i === 0);
+        }
+    }
+
+    async _yieldPairwiseFallbackBatch(batchIndex) {
+        if (batchIndex > 0 && batchIndex % 5000 === 0) {
+            await new Promise(resolve => setImmediate(resolve));
+        }
+    }
+
+    async _computePairwiseSimilaritiesInJs({ fullRebuild = false, minSimilarity = 0.05 } = {}) {
+        const startedAt = Date.now();
+        const threshold = Number.isFinite(Number(minSimilarity)) ? Number(minSimilarity) : 0.05;
+
+        this._ensurePairwiseSimilarityTable();
+
+        const tagVectors = this._loadTagVectorsForPairwise();
+        const pairSet = this._collectCooccurringTagPairs();
+        const cached = new Set();
+
+        if (!fullRebuild) {
+            const cachedRows = this.db.prepare(
+                'SELECT tag_a, tag_b FROM tag_pair_similarity WHERE model_sig = ?'
+            ).all(this.modelSig);
+            for (const row of cachedRows) {
+                const key = this._pairKey(row.tag_a, row.tag_b);
+                if (key) cached.add(key);
+            }
+        }
+
+        const normCache = new Map();
+        const rowsToInsert = [];
+        const computedAt = Date.now();
+        let computedCount = 0;
+        let skippedCount = 0;
+        let index = 0;
+
+        for (const key of pairSet) {
+            index += 1;
+            await this._yieldPairwiseFallbackBatch(index);
+
+            if (cached.has(key)) {
+                skippedCount += 1;
+                continue;
+            }
+
+            const [tagA, tagB] = key.split(':').map(Number);
+            const vectorA = tagVectors.get(tagA);
+            const vectorB = tagVectors.get(tagB);
+            if (!vectorA || !vectorB) {
+                skippedCount += 1;
+                continue;
+            }
+
+            computedCount += 1;
+            const similarity = this._cosineSimilarity(vectorA, vectorB, normCache, tagA, tagB);
+            if (similarity < threshold) {
+                skippedCount += 1;
+                continue;
+            }
+
+            rowsToInsert.push({ tagA, tagB, similarity, computedAt });
+        }
+
+        this._insertPairwiseSimilarities(rowsToInsert, fullRebuild);
+
+        const result = {
+            pairCount: pairSet.size,
+            computedCount,
+            skippedCount,
+            storedCount: rowsToInsert.length,
+            elapsedMs: Date.now() - startedAt
+        };
+
+        console.log(
+            `[TagMemoEngine] ✅ V8.2 JS pairwise sim done: ` +
+            `pairs=${result.pairCount}, computed=${result.computedCount}, ` +
+            `skipped=${result.skippedCount}, stored=${result.storedCount}, ` +
+            `elapsed=${result.elapsedMs.toFixed(2)}ms`
+        );
+
+        return result;
+    }
+
     /**
      * 🌟 V8.2-γ: 触发 Rust 预计算成对语义相似度
      * - 默认增量模式（跳过已缓存且 model_sig 一致的 pair）
@@ -1198,10 +1424,11 @@ class TagMemoEngine {
      */
     async recomputePairwiseSimilarities(opts = {}) {
         const { fullRebuild = false, blocking = false, minSimilarity = 0.05, leaseAlreadyHeld = false } = opts;
+        const hasNativePairwise = !!(this.tagIndex && typeof this.tagIndex.computePairwiseSimilarities === 'function');
 
-        if (!this.tagIndex || !this.tagIndex.computePairwiseSimilarities) {
-            console.warn('[TagMemoEngine] ⚠️ computePairwiseSimilarities is not available in VexusIndex (Rust binary may need rebuild)');
-            return null;
+        if (!hasNativePairwise && !this._pairwiseJsFallbackLogged) {
+            console.warn('[TagMemoEngine] ⚠️ computePairwiseSimilarities is not available in VexusIndex; using JS SQLite fallback for this process.');
+            this._pairwiseJsFallbackLogged = true;
         }
 
         // 锁串行：避免与矩阵重建撞车产生"嵌合矩阵"
@@ -1212,6 +1439,11 @@ class TagMemoEngine {
         }
 
         const run = async () => {
+            if (!hasNativePairwise) {
+                console.log(`[TagMemoEngine] ⚡ V8.2 Triggering JS pairwise similarity fallback (model_sig=${this.modelSig}, fullRebuild=${fullRebuild})...`);
+                return await this._computePairwiseSimilaritiesInJs({ fullRebuild, minSimilarity });
+            }
+
             console.log(`[TagMemoEngine] ⚡ V8.2 Triggering Rust pairwise similarity precomputation (model_sig=${this.modelSig}, fullRebuild=${fullRebuild})...`);
             try {
                 const dbPath = path.join(path.dirname(this.db.name), 'knowledge_base.sqlite');

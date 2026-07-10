@@ -8,6 +8,114 @@ const safeMaxTokens = Math.floor(embeddingMaxToken * 0.85);
 const MAX_BATCH_ITEMS = 100; // Gemini/OpenAI 限制
 const DEFAULT_CONCURRENCY = parseInt(process.env.TAG_VECTORIZE_CONCURRENCY) || 5; // 🌟 读取并发配置
 
+function _normalizeBaseUrl(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function _resolveEmbeddingRequestUrl(apiUrl) {
+    const normalized = _normalizeBaseUrl(apiUrl);
+    return normalized.endsWith('/v1')
+        ? `${normalized}/embeddings`
+        : `${normalized}/v1/embeddings`;
+}
+
+function _normalizeEndpointCandidate(source = {}) {
+    const apiUrl = _normalizeBaseUrl(source.apiUrl || source.embeddingApiUrl || source.url);
+    const apiKey = String(source.apiKey || source.embeddingApiKey || source.key || '').trim();
+    if (!apiUrl || !apiKey) {
+        return null;
+    }
+
+    return {
+        label: String(source.label || source.name || apiUrl).trim(),
+        apiUrl,
+        apiKey,
+        model: String(source.model || source.embeddingModel || '').trim(),
+        modelBackups: source.modelBackups,
+        encodingFormat: String(source.encodingFormat || source.encoding_format || '').trim()
+    };
+}
+
+function _resolveEmbeddingEndpoint(config = {}) {
+    return _normalizeEndpointCandidate({
+        label: 'primary',
+        apiUrl: config.embeddingApiUrl || process.env.EMBEDDING_API_URL || config.apiUrl || process.env.API_URL,
+        apiKey: config.embeddingApiKey
+            || process.env.EMBEDDING_API_Key
+            || process.env.EMBEDDING_API_KEY
+            || config.apiKey
+            || process.env.API_Key
+            || '',
+        model: config.model || process.env.WhitelistEmbeddingModel,
+        modelBackups: config.modelBackups,
+        encodingFormat: config.encodingFormat || process.env.EMBEDDING_ENCODING_FORMAT
+    });
+}
+
+function _readEndpointBackupsFromEnv() {
+    const backups = [];
+
+    const addBackup = (source) => {
+        const normalized = _normalizeEndpointCandidate(source);
+        if (normalized) {
+            backups.push(normalized);
+        }
+    };
+
+    addBackup({
+        label: process.env.EMBEDDING_FALLBACK_LABEL || 'fallback',
+        apiUrl: process.env.EMBEDDING_FALLBACK_API_URL,
+        apiKey: process.env.EMBEDDING_FALLBACK_API_Key || process.env.EMBEDDING_FALLBACK_API_KEY,
+        model: process.env.EMBEDDING_FALLBACK_MODEL,
+        modelBackups: process.env.EMBEDDING_FALLBACK_MODEL_BACKUPS,
+        encodingFormat: process.env.EMBEDDING_FALLBACK_ENCODING_FORMAT
+    });
+
+    for (let i = 1; i <= 9; i++) {
+        addBackup({
+            label: process.env[`EMBEDDING_FALLBACK${i}_LABEL`] || `fallback${i}`,
+            apiUrl: process.env[`EMBEDDING_FALLBACK${i}_API_URL`],
+            apiKey: process.env[`EMBEDDING_FALLBACK${i}_API_Key`] || process.env[`EMBEDDING_FALLBACK${i}_API_KEY`],
+            model: process.env[`EMBEDDING_FALLBACK${i}_MODEL`],
+            modelBackups: process.env[`EMBEDDING_FALLBACK${i}_MODEL_BACKUPS`],
+            encodingFormat: process.env[`EMBEDDING_FALLBACK${i}_ENCODING_FORMAT`]
+        });
+    }
+
+    return backups;
+}
+
+function _getEmbeddingEndpointCandidates(config = {}) {
+    const candidates = [];
+    const seen = new Set();
+    const addEndpoint = (endpoint) => {
+        const normalized = _normalizeEndpointCandidate(endpoint || {});
+        if (!normalized) return;
+        const dedupeKey = [
+            normalized.apiUrl,
+            normalized.apiKey,
+            normalized.model,
+            normalized.encodingFormat
+        ].join('\u0000');
+        if (seen.has(dedupeKey)) return;
+        seen.add(dedupeKey);
+        candidates.push(normalized);
+    };
+
+    addEndpoint(_resolveEmbeddingEndpoint(config));
+
+    const configuredBackups = config.endpointBackups || config.embeddingEndpointBackups || [];
+    if (Array.isArray(configuredBackups)) {
+        configuredBackups.forEach(addEndpoint);
+    } else if (configuredBackups && typeof configuredBackups === 'object') {
+        addEndpoint(configuredBackups);
+    }
+
+    _readEndpointBackupsFromEnv().forEach(addEndpoint);
+
+    return candidates;
+}
+
 function _splitModelList(value) {
     return String(value || '')
         .split(/[,，]/)
@@ -15,7 +123,7 @@ function _splitModelList(value) {
         .filter(Boolean);
 }
 
-function _getEmbeddingModelCandidates(config = {}) {
+function _getEmbeddingModelCandidates(config = {}, endpoint = {}) {
     const candidates = [];
 
     const addModel = (model) => {
@@ -25,7 +133,13 @@ function _getEmbeddingModelCandidates(config = {}) {
         }
     };
 
-    addModel(config.model || process.env.WhitelistEmbeddingModel);
+    addModel(endpoint.model || config.model || process.env.WhitelistEmbeddingModel);
+
+    if (Array.isArray(endpoint.modelBackups)) {
+        endpoint.modelBackups.forEach(addModel);
+    } else if (endpoint.modelBackups) {
+        _splitModelList(endpoint.modelBackups).forEach(addModel);
+    }
 
     if (Array.isArray(config.modelBackups)) {
         config.modelBackups.forEach(addModel);
@@ -49,87 +163,111 @@ function _getEmbeddingModelCandidates(config = {}) {
  * 内部函数：发送单个批次
  */
 async function _sendBatch(batchTexts, config, batchNumber) {
-    const { default: fetch } = await import('node-fetch');
-    const modelCandidates = _getEmbeddingModelCandidates(config);
-    const baseDelay = 1000;
+    const fetch = config.fetchImpl || (await import('node-fetch')).default;
+    const endpointCandidates = _getEmbeddingEndpointCandidates(config);
+    const endpointAttempts = endpointCandidates
+        .map(endpoint => ({ endpoint, models: _getEmbeddingModelCandidates(config, endpoint) }))
+        .filter(attempt => attempt.models.length > 0);
+    const totalAttempts = endpointAttempts.reduce((total, attempt) => total + attempt.models.length, 0);
+    const baseDelay = Number.isFinite(Number(config.retryDelayMs))
+        ? Math.max(0, Number(config.retryDelayMs))
+        : 1000;
+    let attempt = 0;
 
-    for (let attempt = 1; attempt <= modelCandidates.length; attempt++) {
-        const model = modelCandidates[attempt - 1];
-        try {
-            const requestUrl = `${config.apiUrl}/v1/embeddings`;
-            const requestBody = { model, input: batchTexts };
-            const requestHeaders = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` };
+    if (totalAttempts === 0) {
+        throw new Error('Embedding API credentials not configured');
+    }
 
-            const response = await fetch(requestUrl, {
-                method: 'POST',
-                headers: requestHeaders,
-                body: JSON.stringify(requestBody)
-            });
-
-            const responseBodyText = await response.text();
-
-            if (!response.ok) {
-                if (response.status === 429) {
-                    const waitTime = Math.min(5000 * attempt, 15000);
-                    console.warn(`[Embedding] Batch ${batchNumber} model "${model}" rate limited (429). Switching fallback in ${waitTime / 1000}s...`);
-                    await new Promise(r => setTimeout(r, waitTime));
-                    continue;
-                }
-                throw new Error(`API Error ${response.status}: ${responseBodyText.substring(0, 500)}`);
-            }
-
-            let data;
+    for (const endpointAttempt of endpointAttempts) {
+        const { endpoint, models } = endpointAttempt;
+        for (const model of models) {
+            attempt++;
             try {
-                data = JSON.parse(responseBodyText);
-            } catch (parseError) {
-                console.error(`[Embedding] JSON Parse Error for Batch ${batchNumber}:`);
-                console.error(`Response (first 500 chars): ${responseBodyText.substring(0, 500)}`);
-                throw new Error(`Failed to parse API response as JSON: ${parseError.message}`);
+                if (!endpoint.apiUrl || !endpoint.apiKey) {
+                    throw new Error('Embedding API credentials not configured');
+                }
+
+                const requestUrl = _resolveEmbeddingRequestUrl(endpoint.apiUrl);
+                const requestBody = { model, input: batchTexts };
+                const encodingFormat = endpoint.encodingFormat || config.encodingFormat || process.env.EMBEDDING_ENCODING_FORMAT;
+                if (encodingFormat) {
+                    requestBody.encoding_format = encodingFormat;
+                }
+                const requestHeaders = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${endpoint.apiKey}` };
+
+                const response = await fetch(requestUrl, {
+                    method: 'POST',
+                    headers: requestHeaders,
+                    body: JSON.stringify(requestBody)
+                });
+
+                const responseBodyText = await response.text();
+
+                if (!response.ok) {
+                    if (response.status === 429) {
+                        const waitTime = Math.min(5000 * attempt, 15000);
+                        console.warn(`[Embedding] Batch ${batchNumber} endpoint "${endpoint.label}" model "${model}" rate limited (429). Switching fallback in ${waitTime / 1000}s...`);
+                        await new Promise(r => setTimeout(r, waitTime));
+                        continue;
+                    }
+                    throw new Error(`API Error ${response.status}: ${responseBodyText.substring(0, 500)}`);
+                }
+
+                let data;
+                try {
+                    data = JSON.parse(responseBodyText);
+                } catch (parseError) {
+                    console.error(`[Embedding] JSON Parse Error for Batch ${batchNumber}:`);
+                    console.error(`Response (first 500 chars): ${responseBodyText.substring(0, 500)}`);
+                    throw new Error(`Failed to parse API response as JSON: ${parseError.message}`);
+                }
+
+                // 增强的响应结构验证和详细错误信息
+                if (!data) {
+                    throw new Error(`API returned empty/null response`);
+                }
+
+                // 检查是否是错误响应
+                if (data.error) {
+                    const errorMsg = data.error.message || JSON.stringify(data.error);
+                    const errorCode = data.error.code || response.status;
+                    console.error(`[Embedding] API Error for Batch ${batchNumber}:`);
+                    console.error(`  Error Code: ${errorCode}`);
+                    console.error(`  Error Message: ${errorMsg}`);
+                    console.error(`  Hint: Check if embedding model "${model}" is available on your API server`);
+                    throw new Error(`API Error ${errorCode}: ${errorMsg}`);
+                }
+
+                if (!data.data) {
+                    console.error(`[Embedding] Missing 'data' field in response for Batch ${batchNumber}`);
+                    console.error(`Response keys: ${Object.keys(data).join(', ')}`);
+                    console.error(`Response preview: ${JSON.stringify(data).substring(0, 500)}`);
+                    throw new Error(`Invalid API response structure: missing 'data' field`);
+                }
+
+                if (!Array.isArray(data.data)) {
+                    console.error(`[Embedding] 'data' field is not an array for Batch ${batchNumber}`);
+                    console.error(`data type: ${typeof data.data}`);
+                    console.error(`data value: ${JSON.stringify(data.data).substring(0, 200)}`);
+                    throw new Error(`Invalid API response structure: 'data' is not an array`);
+                }
+
+                if (data.data.length === 0) {
+                    console.warn(`[Embedding] Warning: Batch ${batchNumber} returned empty embeddings array`);
+                }
+
+                // 简单的 Log，证明并发正在跑
+                // console.log(`[Embedding] ✅ Batch ${batchNumber} completed (${batchTexts.length} items) via ${model}.`);
+
+                return data.data.sort((a, b) => a.index - b.index).map(item => item.embedding);
+
+            } catch (e) {
+                console.warn(`[Embedding] Batch ${batchNumber}, Endpoint "${endpoint.label}", Model "${model}" failed (${attempt}/${totalAttempts}): ${e.message}`);
+                if (attempt === totalAttempts) throw e;
+                if (baseDelay > 0) {
+                    await new Promise(r => setTimeout(r, baseDelay * Math.min(attempt, 3)));
+                }
             }
-
-            // 增强的响应结构验证和详细错误信息
-            if (!data) {
-                throw new Error(`API returned empty/null response`);
-            }
-
-            // 检查是否是错误响应
-            if (data.error) {
-                const errorMsg = data.error.message || JSON.stringify(data.error);
-                const errorCode = data.error.code || response.status;
-                console.error(`[Embedding] API Error for Batch ${batchNumber}:`);
-                console.error(`  Error Code: ${errorCode}`);
-                console.error(`  Error Message: ${errorMsg}`);
-                console.error(`  Hint: Check if embedding model "${model}" is available on your API server`);
-                throw new Error(`API Error ${errorCode}: ${errorMsg}`);
-            }
-
-            if (!data.data) {
-                console.error(`[Embedding] Missing 'data' field in response for Batch ${batchNumber}`);
-                console.error(`Response keys: ${Object.keys(data).join(', ')}`);
-                console.error(`Response preview: ${JSON.stringify(data).substring(0, 500)}`);
-                throw new Error(`Invalid API response structure: missing 'data' field`);
-            }
-
-            if (!Array.isArray(data.data)) {
-                console.error(`[Embedding] 'data' field is not an array for Batch ${batchNumber}`);
-                console.error(`data type: ${typeof data.data}`);
-                console.error(`data value: ${JSON.stringify(data.data).substring(0, 200)}`);
-                throw new Error(`Invalid API response structure: 'data' is not an array`);
-            }
-
-            if (data.data.length === 0) {
-                console.warn(`[Embedding] Warning: Batch ${batchNumber} returned empty embeddings array`);
-            }
-
-            // 简单的 Log，证明并发正在跑
-            // console.log(`[Embedding] ✅ Batch ${batchNumber} completed (${batchTexts.length} items) via ${model}.`);
-
-            return data.data.sort((a, b) => a.index - b.index).map(item => item.embedding);
-
-        } catch (e) {
-            console.warn(`[Embedding] Batch ${batchNumber}, Model "${model}" failed (${attempt}/${modelCandidates.length}): ${e.message}`);
-            if (attempt === modelCandidates.length) throw e;
-            await new Promise(r => setTimeout(r, baseDelay * attempt));
         }
     }
 }

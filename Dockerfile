@@ -69,6 +69,9 @@ RUN echo ">>> Building rust-vexus-lite native addon..." && \
 # 复制所有源代码
 COPY . .
 
+# RoleCore/registry.json is runtime data; keep the directory available in clean builds.
+RUN mkdir -p RoleCore
+
 # COPY . . 会把仓库中可能滞后的预编译 .node 合并进 rust-vexus-lite。
 # 将上一步容器内现编产物覆盖回去，确保镜像运行时加载的是当前源码对应的 native addon。
 RUN cp /tmp/rust-vexus-lite-built/*.node ./rust-vexus-lite/
@@ -112,7 +115,8 @@ WORKDIR /usr/src/app
 
 # 仅安装运行时的系统依赖
 # 添加 chromium 及其所需依赖，以供 UrlFetch (Puppeteer) 工具使用
-RUN apk add --no-cache \
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+  apk add --no-cache \
   chromium \
   nss \
   freetype \
@@ -140,6 +144,7 @@ COPY --from=build /usr/src/app/pydeps ./pydeps
 COPY --from=build /usr/src/app/*.js ./
 COPY --from=build /usr/src/app/Plugin ./Plugin
 COPY --from=build /usr/src/app/Agent ./Agent
+COPY --from=build /usr/src/app/RoleCore ./RoleCore
 COPY --from=build /usr/src/app/routes ./routes
 COPY --from=build /usr/src/app/modules ./modules
 COPY --from=build /usr/src/app/requirements.txt ./

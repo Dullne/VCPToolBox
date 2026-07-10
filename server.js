@@ -115,6 +115,10 @@ const tdbKnowledgeManager = require('./TDBKnowledge.js'); // 新增：引入 Tri
 const pluginManager = require('./Plugin.js');
 const sarPromptManager = require('./modules/sarPromptManager.js');
 const taskScheduler = require('./routes/taskScheduler.js');
+const createCoreHealthRoutes = require('./routes/coreHealthRoutes.js');
+const createCoreRolesRoutes = require('./routes/coreRolesRoutes.js');
+const createCoreTurnsRoutes = require('./routes/coreTurnsRoutes.js');
+const createCoreMemoryRoutes = require('./routes/coreMemoryRoutes.js');
 const webSocketServer = require('./WebSocketServer.js'); // 新增 WebSocketServer 引入
 const FileFetcherServer = require('./FileFetcherServer.js'); // 引入新的 FileFetcherServer 模块
 const vcpInfoHandler = require('./vcpInfoHandler.js'); // 引入新的 VCP 信息处理器
@@ -847,6 +851,10 @@ app.use((req, res, next) => {
         return next();
     }
 
+    if (req.path === '/api/core/health') {
+        return next();
+    }
+
     const imageServicePathRegex = /^\/pw=[^/]+\/images\//;
     if (imageServicePathRegex.test(req.path)) {
         return next();
@@ -869,6 +877,15 @@ app.use((req, res, next) => {
     }
     next();
 });
+
+app.use('/api/core', createCoreHealthRoutes());
+app.use('/api/core', createCoreRolesRoutes());
+app.use('/api/core', createCoreTurnsRoutes());
+app.use('/api/core', createCoreMemoryRoutes({
+    pluginManager,
+    knowledgeBaseManager,
+    defaultTimezone: DEFAULT_TIMEZONE
+}));
 
 // This function is no longer needed as the EmojiListGenerator plugin handles generation.
 // async function updateAndLoadAgentEmojiList(agentName, dirPath, filePath) { ... }

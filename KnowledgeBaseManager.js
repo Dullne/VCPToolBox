@@ -44,6 +44,8 @@ class KnowledgeBaseManager {
             maxDeleteBatchSize: parseInt(process.env.KNOWLEDGEBASE_MAX_DELETE_BATCH_SIZE, 10) || 2000,
             deleteRebuildThreshold: parseInt(process.env.KNOWLEDGEBASE_DELETE_REBUILD_THRESHOLD, 10) || 5000,
             migrationCacheTtlMs: parseInt(process.env.KNOWLEDGEBASE_MIGRATION_CACHE_TTL_MS, 10) || 2 * 60 * 1000,
+            sqliteJournalMode: config.sqliteJournalMode || process.env.KNOWLEDGEBASE_SQLITE_JOURNAL_MODE || 'WAL',
+            sqliteSynchronous: config.sqliteSynchronous || process.env.KNOWLEDGEBASE_SQLITE_SYNCHRONOUS || 'NORMAL',
             // 🛡️ Rust 派生表写入租约：避免 rusqlite 与 better-sqlite3 双写 WAL 竞态
             rustWriteLeaseGraceMs: parseInt(process.env.KNOWLEDGEBASE_RUST_WRITE_LEASE_GRACE_MS, 10) || 30000,
             rustWriteLeaseCooldownMs: parseInt(process.env.KNOWLEDGEBASE_RUST_WRITE_LEASE_COOLDOWN_MS, 10) || 10000,
@@ -343,9 +345,34 @@ class KnowledgeBaseManager {
         }
     }
 
+    _resolveSqlitePragmaValue(value, allowedValues, fallback, label) {
+        const normalized = String(value || '').trim().toUpperCase();
+        if (allowedValues.has(normalized)) {
+            return normalized;
+        }
+        console.warn(`[KnowledgeBase] Invalid ${label} "${value}", falling back to ${fallback}.`);
+        return fallback;
+    }
+
     _configureDatabaseConnection(db) {
-        db.pragma('journal_mode = WAL');
-        db.pragma('synchronous = NORMAL');
+        const journalMode = this._resolveSqlitePragmaValue(
+            this.config.sqliteJournalMode,
+            new Set(['WAL', 'DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY']),
+            'WAL',
+            'SQLite journal mode'
+        );
+        const synchronous = this._resolveSqlitePragmaValue(
+            this.config.sqliteSynchronous,
+            new Set(['OFF', 'NORMAL', 'FULL', 'EXTRA']),
+            'NORMAL',
+            'SQLite synchronous mode'
+        );
+
+        const appliedJournalMode = String(db.pragma(`journal_mode = ${journalMode}`, { simple: true }) || '').toUpperCase();
+        if (appliedJournalMode && appliedJournalMode !== journalMode) {
+            console.warn(`[KnowledgeBase] SQLite applied journal_mode=${appliedJournalMode}, requested ${journalMode}.`);
+        }
+        db.pragma(`synchronous = ${synchronous}`);
         // 🛡️ SQLite 默认不启用外键；必须显式开启，避免文件删除后 chunks/file_tags 残留。
         db.pragma('foreign_keys = ON');
     }
@@ -1680,6 +1707,369 @@ class KnowledgeBaseManager {
         } catch (e) {
             return [];
         }
+    }
+
+    _resolveIndexableFile(filePath) {
+        const rawPath = String(filePath || '').trim();
+        const rootPath = path.resolve(this.config.rootPath);
+        const absolutePath = path.isAbsolute(rawPath)
+            ? path.resolve(rawPath)
+            : path.resolve(rootPath, rawPath);
+        const relPath = path.relative(rootPath, absolutePath);
+
+        if (!relPath || relPath.startsWith('..') || path.isAbsolute(relPath)) {
+            return { ok: false, reason: 'outside-root', file_path: absolutePath };
+        }
+        if (!absolutePath.match(/\.(md|txt)$/i)) {
+            return { ok: false, reason: 'unsupported-extension', file_path: absolutePath, rel_path: relPath };
+        }
+
+        const parts = relPath.split(path.sep);
+        const diaryName = parts.length > 1 ? parts[0] : 'Root';
+        const fileName = path.basename(relPath);
+
+        if (this.config.ignoreFolders.includes(diaryName)) {
+            return { ok: false, reason: 'ignored-folder', file_path: absolutePath, rel_path: relPath, diary_name: diaryName };
+        }
+        if (this.config.ignorePrefixes.some(prefix => diaryName.startsWith(prefix) || fileName.startsWith(prefix))) {
+            return { ok: false, reason: 'ignored-prefix', file_path: absolutePath, rel_path: relPath, diary_name: diaryName };
+        }
+        if (this.config.ignoreSuffixes.some(suffix => diaryName.endsWith(suffix) || fileName.endsWith(suffix))) {
+            return { ok: false, reason: 'ignored-suffix', file_path: absolutePath, rel_path: relPath, diary_name: diaryName };
+        }
+
+        return {
+            ok: true,
+            file_path: absolutePath,
+            rel_path: relPath,
+            diary_name: diaryName
+        };
+    }
+
+    queueFileForIndex(filePath, options = {}) {
+        if (!this.initialized) {
+            return { queued: false, index_status: 'not_initialized' };
+        }
+        if (this.databaseCorruptionDetected || this.dbHealthState === 'corrupt') {
+            return { queued: false, index_status: 'database_unavailable', db_health: this.dbHealthState };
+        }
+
+        const resolved = this._resolveIndexableFile(filePath);
+        if (!resolved.ok) {
+            return { queued: false, index_status: 'skipped', ...resolved };
+        }
+
+        let stats;
+        try {
+            stats = fsSync.statSync(resolved.file_path);
+        } catch (error) {
+            return {
+                queued: false,
+                index_status: 'missing',
+                file_path: resolved.file_path,
+                rel_path: resolved.rel_path,
+                error: error.message
+            };
+        }
+
+        if (!stats.isFile()) {
+            return {
+                queued: false,
+                index_status: 'skipped',
+                reason: 'not-a-file',
+                file_path: resolved.file_path,
+                rel_path: resolved.rel_path
+            };
+        }
+
+        const alreadyQueued = this.pendingFiles.has(resolved.file_path);
+        this.pendingFiles.add(resolved.file_path);
+
+        if (options.flush === 'immediate') {
+            setImmediate(() => {
+                this._flushBatch().catch(error => {
+                    console.error('[KnowledgeBase] Explicit index queue flush failed:', error);
+                });
+            });
+        } else if (this.pendingFiles.size >= this.config.maxBatchSize) {
+            this._flushBatch().catch(error => {
+                console.error('[KnowledgeBase] Explicit index queue batch failed:', error);
+            });
+        } else {
+            this._scheduleBatch();
+        }
+
+        return {
+            queued: true,
+            index_status: alreadyQueued ? 'already_queued' : 'queued',
+            file_path: resolved.file_path,
+            rel_path: resolved.rel_path,
+            diary_name: resolved.diary_name,
+            pending_files: this.pendingFiles.size
+        };
+    }
+
+    getFileIndexStatus(filePath) {
+        if (!this.initialized) {
+            return { index_status: 'not_initialized', indexed: false };
+        }
+        if (this.databaseCorruptionDetected || this.dbHealthState === 'corrupt') {
+            return {
+                index_status: 'database_unavailable',
+                indexed: false,
+                db_health: this.dbHealthState
+            };
+        }
+
+        const resolved = this._resolveIndexableFile(filePath);
+        if (!resolved.ok) {
+            return { index_status: 'skipped', indexed: false, ...resolved };
+        }
+
+        const queued = this.pendingFiles.has(resolved.file_path);
+        const expectedBytes = this.config.dimension * Float32Array.BYTES_PER_ELEMENT;
+        const row = this.db.prepare(`
+            SELECT
+                f.id,
+                f.path,
+                f.diary_name,
+                f.mtime,
+                f.size,
+                f.updated_at,
+                COUNT(c.id) AS chunk_count,
+                SUM(CASE WHEN c.vector IS NOT NULL THEN 1 ELSE 0 END) AS vector_count,
+                SUM(CASE WHEN c.vector IS NOT NULL AND length(c.vector) = ? THEN 1 ELSE 0 END) AS valid_vector_count,
+                SUM(CASE WHEN c.vector IS NOT NULL AND length(c.vector) != ? THEN 1 ELSE 0 END) AS bad_vector_count
+            FROM files f
+            LEFT JOIN chunks c ON c.file_id = f.id
+            WHERE f.path = ?
+            GROUP BY f.id
+        `).get(expectedBytes, expectedBytes, resolved.rel_path);
+
+        if (!row) {
+            return {
+                index_status: queued ? 'queued' : 'not_indexed',
+                indexed: false,
+                queued,
+                ...resolved
+            };
+        }
+
+        const chunkCount = Number(row.chunk_count || 0);
+        const vectorCount = Number(row.vector_count || 0);
+        const validVectorCount = Number(row.valid_vector_count || 0);
+        const badVectorCount = Number(row.bad_vector_count || 0);
+        let stale = false;
+        try {
+            const stats = fsSync.statSync(resolved.file_path);
+            stale = Math.abs(Number(row.mtime || 0) - stats.mtimeMs) > 1 || Number(row.size || 0) !== stats.size;
+        } catch (_) {
+            stale = true;
+        }
+        const indexed = chunkCount > 0 && chunkCount === validVectorCount && badVectorCount === 0;
+        const indexStatus = stale
+            ? 'stale'
+            : indexed
+            ? 'indexed'
+            : (chunkCount === 0 ? 'pending_vectors' : 'partial_vectors');
+
+        return {
+            index_status: indexStatus,
+            indexed: indexed && !stale,
+            stale,
+            queued,
+            file_recorded: true,
+            file_id: row.id,
+            file_path: resolved.file_path,
+            rel_path: row.path,
+            diary_name: row.diary_name,
+            mtime: row.mtime,
+            size: row.size,
+            updated_at: row.updated_at,
+            chunk_count: chunkCount,
+            vector_count: vectorCount,
+            valid_vector_count: validVectorCount,
+            bad_vector_count: badVectorCount
+        };
+    }
+
+    listIndexRequeueCandidates(options = {}) {
+        if (!this.initialized) {
+            return { ok: false, index_status: 'not_initialized', items: [] };
+        }
+        if (this.databaseCorruptionDetected || this.dbHealthState === 'corrupt') {
+            return {
+                ok: false,
+                index_status: 'database_unavailable',
+                db_health: this.dbHealthState,
+                items: []
+            };
+        }
+
+        const clampInt = (value, fallback, min, max) => {
+            const parsed = Number.parseInt(value, 10);
+            if (!Number.isFinite(parsed)) return fallback;
+            return Math.max(min, Math.min(max, parsed));
+        };
+        const limit = clampInt(options.limit, 10, 1, 100);
+        const maxScan = clampInt(options.max_scan ?? options.maxScan, 200, 1, 5000);
+        const includeIndexed = Boolean(options.include_indexed ?? options.includeIndexed);
+        const statusOption = Array.isArray(options.statuses) ? '' : options.statuses;
+        const rawStatuses = Array.isArray(options.statuses) && options.statuses.length > 0
+            ? options.statuses
+            : String(statusOption || options.status || 'not_indexed,pending_vectors,partial_vectors,stale').split(/[,，]/);
+        const statuses = new Set(rawStatuses.map(status => String(status || '').trim()).filter(Boolean));
+        const notebook = String(options.notebook || options.diary || '').trim();
+        const rootPath = path.resolve(this.config.rootPath);
+        const scanRoot = notebook ? path.resolve(rootPath, notebook) : rootPath;
+        const scanRootRel = path.relative(rootPath, scanRoot);
+
+        if (scanRootRel.startsWith('..') || path.isAbsolute(scanRootRel)) {
+            return {
+                ok: false,
+                index_status: 'invalid_scan_root',
+                error: 'scan root must be inside knowledge root',
+                items: []
+            };
+        }
+        if (!fsSync.existsSync(scanRoot)) {
+            return {
+                ok: true,
+                index_status: 'scan_root_missing',
+                root_path: rootPath,
+                scan_root: scanRoot,
+                notebook: notebook || null,
+                limit,
+                max_scan: maxScan,
+                scanned_count: 0,
+                matched_count: 0,
+                items: []
+            };
+        }
+
+        const candidates = [];
+        const skipped = {
+            unreadable_dirs: 0,
+            ignored_dirs: 0,
+            unsupported_files: 0,
+            skipped_files: 0
+        };
+
+        const shouldSkipDirectory = (entryName, absPath) => {
+            const relPath = path.relative(rootPath, absPath);
+            const parts = relPath.split(path.sep);
+            const diaryName = parts.length > 1 ? parts[0] : entryName;
+            return (
+                entryName === 'node_modules' ||
+                entryName === '.git' ||
+                entryName === 'dist' ||
+                entryName === 'target' ||
+                entryName === 'image' ||
+                entryName.startsWith('.') ||
+                this.config.ignoreFolders.includes(entryName) ||
+                this.config.ignoreFolders.includes(diaryName) ||
+                this.config.ignorePrefixes.some(prefix => entryName.startsWith(prefix)) ||
+                this.config.ignoreSuffixes.some(suffix => entryName.endsWith(suffix))
+            );
+        };
+
+        const walk = (dir) => {
+            if (candidates.length >= maxScan) return;
+            let entries;
+            try {
+                entries = fsSync.readdirSync(dir, { withFileTypes: true });
+            } catch (_) {
+                skipped.unreadable_dirs++;
+                return;
+            }
+
+            entries.sort((a, b) => {
+                if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+                return a.name.localeCompare(b.name);
+            });
+
+            for (const entry of entries) {
+                if (candidates.length >= maxScan) break;
+                const absPath = path.join(dir, entry.name);
+
+                if (entry.isDirectory()) {
+                    if (shouldSkipDirectory(entry.name, absPath)) {
+                        skipped.ignored_dirs++;
+                        continue;
+                    }
+                    walk(absPath);
+                    continue;
+                }
+
+                if (!entry.isFile()) continue;
+                if (!absPath.match(/\.(md|txt)$/i)) {
+                    skipped.unsupported_files++;
+                    continue;
+                }
+
+                const resolved = this._resolveIndexableFile(absPath);
+                if (!resolved.ok) {
+                    skipped.skipped_files++;
+                    continue;
+                }
+
+                let stats;
+                try {
+                    stats = fsSync.statSync(resolved.file_path);
+                } catch (_) {
+                    skipped.skipped_files++;
+                    continue;
+                }
+
+                candidates.push({
+                    file_path: resolved.file_path,
+                    rel_path: resolved.rel_path,
+                    diary_name: resolved.diary_name,
+                    size: stats.size,
+                    mtime: stats.mtimeMs
+                });
+            }
+        };
+
+        walk(scanRoot);
+        candidates.sort((a, b) => b.mtime - a.mtime || a.rel_path.localeCompare(b.rel_path));
+
+        const items = [];
+        for (const candidate of candidates) {
+            if (items.length >= limit) break;
+            const status = this.getFileIndexStatus(candidate.file_path);
+            const matched = includeIndexed || statuses.has(status.index_status);
+            if (!matched) continue;
+            items.push({
+                ...candidate,
+                index_status: status.index_status,
+                indexed: status.indexed,
+                queued: status.queued,
+                file_recorded: Boolean(status.file_recorded),
+                file_id: status.file_id || null,
+                chunk_count: status.chunk_count || 0,
+                vector_count: status.vector_count || 0,
+                valid_vector_count: status.valid_vector_count || 0,
+                bad_vector_count: status.bad_vector_count || 0,
+                error: status.error || null
+            });
+        }
+
+        return {
+            ok: true,
+            index_status: 'candidate_scan_complete',
+            root_path: rootPath,
+            scan_root: scanRoot,
+            notebook: notebook || null,
+            statuses: [...statuses],
+            include_indexed: includeIndexed,
+            limit,
+            max_scan: maxScan,
+            scanned_count: candidates.length,
+            matched_count: items.length,
+            skipped,
+            items
+        };
     }
 
     _startWatcher() {

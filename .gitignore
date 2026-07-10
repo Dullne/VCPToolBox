@@ -168,8 +168,12 @@ dailynote/*
 !dailynote/VCP开发/**
 ip_blacklist.json
 /VectorStore
+sarprompt.json
+RoleCore/registry.json
 
 # 插件缓存文件
+Plugin/VCPBridgeServer/bridge-config.json
+Plugin/VCPTaskAssistant/task-center-data.json
 Plugin/ArtistMatcher/artist_cache.json
 Plugin/DailyHot/dailyhot_cache.md
 Plugin/EmojiListGenerator/generated_lists/

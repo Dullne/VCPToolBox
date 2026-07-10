@@ -15,6 +15,13 @@ config.env
 Plugin/*/config.env
 Plugin/*/.env
 
+# Runtime-generated local state
+sarprompt.json
+RoleCore/registry.json
+Plugin/UserAuth/code.bin
+Plugin/VCPBridgeServer/bridge-config.json
+Plugin/VCPTaskAssistant/task-center-data.json
+
 # Cache and data directories (to be mounted as volumes or handled by named volumes)
 Plugin/WeatherReporter/city_cache.txt
 Plugin/VCPLog/log/

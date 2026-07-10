@@ -60,6 +60,26 @@ class BM25Ranker {
     }
 }
 
+function emptyDiaryContext(characterName) {
+    return `[${characterName}日记本内容为空]`;
+}
+
+function missingDiaryContext(characterName) {
+    return `[无法读取"${characterName}"的日记本，可能不存在]`;
+}
+
+function shouldOmitDirectDiaryInjection(characterName, diaryContent) {
+    const text = String(diaryContent || '').trim();
+    if (!text) {
+        return true;
+    }
+
+    return text === emptyDiaryContext(characterName)
+        || text === missingDiaryContext(characterName)
+        || /^\[检测到循环引用，已跳过".*日记本"的解析\]$/.test(text)
+        || /^\[处理失败:/.test(text);
+}
+
 /**
  * 纯文本日记占位符处理器。
  *
@@ -468,7 +488,7 @@ class DirectDiaryTextProcessor {
 
     async getDiaryContent(characterName) {
         const characterDirPath = path.join(this.dailyNoteRootPath, characterName);
-        let characterDiaryContent = `[${characterName}日记本内容为空]`;
+        let characterDiaryContent = emptyDiaryContext(characterName);
         try {
             const files = await fs.readdir(characterDirPath);
             const relevantFiles = files.filter(file => {
@@ -493,7 +513,7 @@ class DirectDiaryTextProcessor {
             if (charDirError.code !== 'ENOENT') {
                 this.logger.error(`[DirectDiaryTextProcessor] Error reading character directory ${characterDirPath}:`, charDirError.message);
             }
-            characterDiaryContent = `[无法读取“${characterName}”的日记本，可能不存在]`;
+            characterDiaryContent = missingDiaryContext(characterName);
         }
         return characterDiaryContent;
     }
@@ -510,7 +530,7 @@ class DirectDiaryTextProcessor {
             const recentFiles = await this.getRecentDiaryFileMetas(characterName, safeLimit);
 
             if (recentFiles.length === 0) {
-                return `[${characterName}日记本内容为空]`;
+                return emptyDiaryContext(characterName);
             }
 
             if (safeLimit > recentFiles.length) {
@@ -522,7 +542,7 @@ class DirectDiaryTextProcessor {
             if (charDirError.code !== 'ENOENT') {
                 this.logger.error(`[DirectDiaryTextProcessor] Error reading recent diary files in ${characterDirPath}:`, charDirError.message);
             }
-            return `[无法读取“${characterName}”的日记本，可能不存在]`;
+            return missingDiaryContext(characterName);
         }
     }
 
@@ -538,7 +558,7 @@ class DirectDiaryTextProcessor {
             });
 
             if (diaryFiles.length === 0) {
-                return `[${characterName}日记本内容为空]`;
+                return emptyDiaryContext(characterName);
             }
 
             if (safeLimit > diaryFiles.length) {
@@ -559,7 +579,7 @@ class DirectDiaryTextProcessor {
             if (charDirError.code !== 'ENOENT') {
                 this.logger.error(`[DirectDiaryTextProcessor] Error reading random diary files in ${characterDirPath}:`, charDirError.message);
             }
-            return `[无法读取“${characterName}”的日记本，可能不存在]`;
+            return missingDiaryContext(characterName);
         }
     }
 
@@ -691,7 +711,7 @@ class DirectDiaryTextProcessor {
             if (recentFiles.length === 0) {
                 return {
                     matched: false,
-                    content: `[${characterName}日记本内容为空]`,
+                    content: emptyDiaryContext(characterName),
                     matchedCount: 0,
                     queryTokens: []
                 };
@@ -756,7 +776,7 @@ class DirectDiaryTextProcessor {
             }
             return {
                 matched: false,
-                content: `[无法读取“${characterName}”的日记本，可能不存在]`,
+                content: missingDiaryContext(characterName),
                 matchedCount: 0,
                 queryTokens: []
             };
@@ -783,6 +803,9 @@ class DirectDiaryTextProcessor {
 
         const processedDiaries = options.processedDiaries || new Set();
         const messages = Array.isArray(options.messages) ? options.messages : [];
+        const processedDiaryContents = options.processedDiaryContents instanceof Map
+            ? options.processedDiaryContents
+            : new Map();
         const evaluateRoleValve = typeof options.evaluateRoleValve === 'function'
             ? options.evaluateRoleValve
             : () => true;
@@ -803,8 +826,8 @@ class DirectDiaryTextProcessor {
             }
 
             if (processedDiaries.has(dbName)) {
-                this.logger.warn(`[DirectDiaryTextProcessor] Detected circular reference to "${dbName}" in {{...}}. Skipping.`);
-                return { placeholder, content: `[检测到循环引用，已跳过"${dbName}日记本"的解析]` };
+                this.logger.warn(`[DirectDiaryTextProcessor] Detected duplicate reference to "${dbName}" in {{...}}. Omitting repeated injection.`);
+                return { placeholder, content: '' };
             }
 
             processedDiaries.add(dbName);
@@ -835,10 +858,15 @@ class DirectDiaryTextProcessor {
                 }
 
                 const safeContent = this.sanitizeNestedPlaceholders(diaryContent);
+                const injectedContent = shouldOmitDirectDiaryInjection(dbName, safeContent) ? '' : safeContent;
+                processedDiaryContents.set(dbName, injectedContent);
 
                 if (pushVcpInfo) {
                     let message;
-                    if (useBM25 && bm25Result?.matched) {
+                    const hasInjectedContent = String(injectedContent || '').trim().length > 0;
+                    if (!hasInjectedContent) {
+                        message = `[RAGDiary] 日记本为空或不存在：${dbName}，未向上下文注入内容`;
+                    } else if (useBM25 && bm25Result?.matched) {
                         const bm25Label = bm25Mode === 'body' ? '正文 BM25+' : 'Tag 行 BM25';
                         message = `[RAGDiary] 已按 ${bm25Label} 引入日记本：${dbName}，候选范围为最新 ${effectiveLastLimit} 条，命中 ${bm25Result.matchedCount} 条`;
                     } else if (useBM25) {
@@ -860,7 +888,7 @@ class DirectDiaryTextProcessor {
                     });
                 }
 
-                return { placeholder, content: safeContent };
+                return { placeholder, content: injectedContent };
             } catch (error) {
                 this.logger.error(`[DirectDiaryTextProcessor] 处理 {{...日记本}} 直接引入模式出错 (${dbName}):`, error);
                 return { placeholder, content: `[处理失败: ${error.message}]` };
@@ -925,12 +953,14 @@ class DirectDiaryTextProcessor {
 
         const newMessages = JSON.parse(JSON.stringify(messages));
         const processedDiaries = new Set();
+        const processedDiaryContents = new Map();
 
         await Promise.all(targetIndices.map(async (index) => {
             const currentMessage = newMessages[index];
             const rawText = extractTextFromContent(currentMessage.content);
             const processedContent = await this.processContent(rawText, {
                 processedDiaries,
+                processedDiaryContents,
                 messages,
                 sanitizedUserInput: helpers.sanitizedUserInput,
                 evaluateRoleValve: helpers.evaluateRoleValve,
